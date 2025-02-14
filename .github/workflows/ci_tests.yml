@@ -1,53 +1,133 @@
-# CI Tests
-# These should only be run on main, because they access secrets
+# These access secrets, so should only be run on local branches.
 
 name: CI Tests
 
-
-
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+    inputs:
+      commit_id:
+        description: 'Branch or Commit ID (optional)'
+        required: false
+        type: string
   schedule:
     # * is a special character in YAML so we quote this string
-    # Run at 1030 UTC every day
-    - cron:  '30 10 * * *'
+    # Run at 09:00 UTC every day
+    - cron:  '00 09 * * *'
 
 jobs:
-  build:
-
+  credentialed_tests:
     runs-on: ubuntu-latest
+    environment: test
     strategy:
+      fail-fast: false # Don't cancel all on first failure
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
-
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    permissions:
+      id-token: write  # for Azure CLI login
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repo at ${{ github.event_name == 'workflow_dispatch' && inputs.commit_id || github.sha }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_id || github.sha }}
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
+      - name: Install Rust
+        shell: bash
+        run: |
+           curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain 1.75.0
+           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Install guidance
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
-          pip install -e .[test]
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      - name: Test with pytest
-        env:
-          # Indicate that secrets should be available
-          EXPECT_SECRETS: 1
-          # Configure endpoints
-          AZUREAI_CHAT_ENDPOINT: ${{ secrets.AZUREAI_CHAT_ENDPOINT }}
-          AZUREAI_CHAT_KEY: ${{ secrets.AZUREAI_CHAT_KEY }}
-          AZUREAI_CHAT_MODEL: ${{ secrets.AZUREAI_CHAT_MODEL }}
-          AZUREAI_COMPLETION_ENDPOINT: ${{ secrets.AZUREAI_COMPLETION_ENDPOINT }}
-          AZUREAI_COMPLETION_KEY: ${{ secrets.AZUREAI_COMPLETION_KEY }}
-          AZUREAI_COMPLETION_MODEL: ${{ secrets.AZUREAI_COMPLETION_MODEL }}
+          python -m pip install -e .[all,test]
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+            client-id: ${{ secrets.AZURE_CLIENT_ID }}
+            tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+            subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: 'Run Azure CLI commands'
         run: |
-          pytest --cov=guidance --cov-report=xml --cov-report=term-missing ./tests/models/test_azureai_openai.py
+            az account show
+            az group list
+      - name: Model tests
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Configure endpoints for Azure OpenAI
+          AZUREAI_CHAT_ENDPOINT: ${{ vars.AZUREAI_CHAT_ENDPOINT }}
+          AZUREAI_CHAT_MODEL: ${{ vars.AZUREAI_CHAT_MODEL }}
+          AZUREAI_COMPLETION_ENDPOINT: ${{ vars.AZUREAI_COMPLETION_ENDPOINT }}
+          AZUREAI_COMPLETION_MODEL: ${{ vars.AZUREAI_COMPLETION_MODEL }}
+          # Configure endpoints for Azure AI Studio
+          AZURE_AI_STUDIO_PHI3_ENDPOINT: ${{ vars.AZURE_AI_STUDIO_PHI3_ENDPOINT }}
+          AZURE_AI_STUDIO_PHI3_DEPLOYMENT: ${{ vars.AZURE_AI_STUDIO_PHI3_DEPLOYMENT }}
+          AZURE_AI_STUDIO_PHI3_KEY: ${{ secrets.AZURE_AI_STUDIO_PHI3_KEY }}
+          AZURE_AI_STUDIO_MISTRAL_CHAT_ENDPOINT: ${{ vars.AZURE_AI_STUDIO_MISTRAL_CHAT_ENDPOINT }}
+          AZURE_AI_STUDIO_MISTRAL_CHAT_DEPLOYMENT: ${{ vars.AZURE_AI_STUDIO_MISTRAL_CHAT_DEPLOYMENT }}
+          AZURE_AI_STUDIO_MISTRAL_CHAT_KEY: ${{ secrets.AZURE_AI_STUDIO_MISTRAL_CHAT_KEY }}
+          AZURE_AI_STUDIO_LLAMA3_CHAT_ENDPOINT: ${{ vars.AZURE_AI_STUDIO_LLAMA3_CHAT_ENDPOINT }}
+          AZURE_AI_STUDIO_LLAMA3_CHAT_DEPLOYMENT: ${{ vars.AZURE_AI_STUDIO_LLAMA3_CHAT_DEPLOYMENT }}
+          AZURE_AI_STUDIO_LLAMA3_CHAT_KEY: ${{ secrets.AZURE_AI_STUDIO_LLAMA3_CHAT_KEY }}
+        run: |
+          pytest -vv --cov=guidance --cov-report=xml --cov-report=term-missing \
+            ./tests/need_credentials
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  cpu_small:
+    strategy:
+      fail-fast: false # Don't cancel all on first failure
+      matrix:
+        os: ["Large_Linux", "Large_Windows", "macos-latest"]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        model:
+          - "transformers_gpt2_cpu"
+          - "llamacpp_phi3_mini_4k_instruct_cpu"
+          - "llamacpp_gemma2_9b_cpu"
+    uses: ./.github/workflows/call_cpu_tests.yml
+    with:
+      os: ${{ matrix.os }}
+      python-version: ${{ matrix.python-version }}
+      model: ${{ matrix.model }}
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  cpu_big:
+    strategy:
+      fail-fast: false # Don't cancel all on first failure
+      matrix:
+        os: ["Large_Linux", "Large_Windows"]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        model:
+          - "llamacpp_llama2_7b_cpu"
+          - "transformers_llama3_8b_cpu"
+    uses: ./.github/workflows/call_cpu_tests.yml
+    with:
+      os: ${{ matrix.os }}
+      python-version: ${{ matrix.python-version }}
+      model: ${{ matrix.model }}
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  gpu_tests:
+    strategy:
+      fail-fast: false # Don't cancel all on first failure
+      matrix:
+        os: ["gpu-runner"]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        model:
+          - "transformers_gpt2_gpu"
+          - "transformers_gemma2_9b_gpu"
+          - "llamacpp_llama2_7b_gpu"
+          - "transformers_gemma2_9b_cpu"  # CUDA is required for this model
+    uses: ./.github/workflows/call_gpu_tests.yml
+    with:
+      os: ${{ matrix.os }}
+      python-version: ${{ matrix.python-version }}
+      model: ${{ matrix.model }}
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}

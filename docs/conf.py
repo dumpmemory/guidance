@@ -61,6 +61,9 @@ autodoc_default_options = {
 autosummary_generate = True
 numpydoc_show_class_members = False
 
+# Don't try to execute the notebooks, they overwhelm RTD
+nbsphinx_execute = 'never'
+
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
 
@@ -385,7 +388,7 @@ texinfo_documents = [
 
 
 def setup(app):
-    import guidance
+    from guidance import guidance
     app.connect('build-finished', build_finished)
 
 

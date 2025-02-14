@@ -1,31 +1,46 @@
 import regex as regex_module
 import logging
-import guidance
-from ._silent import silent
-from .._grammar import select
-from ._zero_or_more import zero_or_more
-from .._grammar import commit_point
-from ._any_char import any_char
-from .._grammar import capture
-from ._regex import regex as regex_grammar
-from .._grammar import token_limit, eos_token, active_role_end, with_temperature
-from ._tool import Tool
+from .._guidance import guidance
+from .._grammar import select, Gen, quote_regex, capture, token_limit, with_temperature
 from ._block import block
+from ._silent import silent
+from ._tool import Tool
 
 logger = logging.getLogger(__name__)
 
+
 # TODO: make this stateless!
-@guidance(stateless=lambda *args, **kwargs: kwargs.get("tools", None) is None) # TODO: uncomment this once we get temperature stateless
-def gen(lm, name=None, *, max_tokens=1000, list_append=False, regex=None,
-        tools=None, hide_tool_call=False, stop=None, stop_regex=None, suffix="", n=1, temperature=0.0, top_p=1.0,
-        save_stop_text=False):
-    """ Generate a set of tokens until a given stop criteria has been met.
+# TODO: uncomment this once we get temperature stateless
+@guidance(stateless=lambda *args, **kwargs: kwargs.get("tools", None) is None)
+def gen(
+    lm,
+    name=None,
+    *,
+    max_tokens=None,
+    list_append=False,
+    regex=None,
+    tools=None,
+    hide_tool_call=False,
+    stop=None,
+    stop_regex=None,
+    suffix="",
+    n=1,
+    temperature=0.0,
+    top_p=1.0,
+    save_stop_text=False,
+):
+    """Generate a set of tokens until a given stop criteria has been met.
 
     This function is a useful utility that can allow you to specify most grammars used by typical
     LM generation programs. It also has the added ability to interleave generation with tool calls.
 
+        >>> lm += gen("my_generation", max_tokens=10)
+        >>> print(lm["my_generation"])
+        some text from the LLM
+
     Parameters
-        ----------
+    ----------
+
         name : str or None
             If this is not None then the the results of the generation will be saved as a variable on
             the Model object (so you can access the result as `lm["var_name"]`).
@@ -39,7 +54,7 @@ def gen(lm, name=None, *, max_tokens=1000, list_append=False, regex=None,
             If this is True then the results saved to `lm[name]` will not be written directly but rather appended
             to a list (if no list with the current name is present one will be created). This is useful for
             building lists inside python loops.
-        
+
         regex : str or None
             This is a regular expression that will be used to constrain the generation. The model is only allowed
             to generate tokens that match this regular expression. Note that for variable length expressions the
@@ -77,101 +92,102 @@ def gen(lm, name=None, *, max_tokens=1000, list_append=False, regex=None,
             call from the model's context if you plan to change it's format after the call is made.
     """
     # TODO: expand the tools doc string
-    assert n == 1, "We still need to add support for n>1! Consider putting your gen call in a loop for now."
+    if [tools, regex].count(None) == 0:
+            raise ValueError("Cannot use regex with tools")
+
+    assert (
+        n == 1
+    ), "We still need to add support for n>1! Consider putting your gen call in a loop for now."
     assert top_p == 1, "We still need to add support for top_p != 1!"
-    
+
     logger.debug(f'start gen(name="{name}")')
 
-    # set stream if we are interactive
-    # if stream_tokens is None and not lm.is_silent() and n == 1:
-    #     stream_tokens = True
-
-    # use the suffix as the stop string if not otherwise specified
-    # TODO: still need to make suffix work with grammars
-    # eos_token = lm.eos_token.decode('utf8')
     if stop is None and stop_regex is None and suffix != "":
         stop = suffix
-    # if stop is None and stop_regex is None and getattr(lm, "suffix", False):
-    #     if lm.suffix.startswith("\n"):
-    #         stop = "\n"
-    #     elif lm.suffix.startswith('"') and str(lm).endswith('"'):
-    #         stop = '"'
-    #     elif lm.suffix.startswith("'") and str(lm).endswith("'"):
-    #         stop = "'"
 
-    # fall back to stopping at the EOS token
+    # Empty stop condition is implicitly the EOS token
+    gen_stop = ""
     if stop is not False:
         if stop is None:
             stop = []
         if isinstance(stop, str):
             stop = [stop]
-        if regex is None:
-            stop.append(select([eos_token(), active_role_end()]))
 
         if stop_regex is None:
             stop_regex = []
         if isinstance(stop_regex, str):
             stop_regex = [stop_regex]
-        stop_regex = [regex_grammar(x) for x in stop_regex]
 
-    # This needs to be here for streaming
-    # if name is not None and not list_append:
-    #     lm[name] = ""
-    
-    # define the generation pattern
-    if regex is not None:
-        pattern = regex_grammar(regex)
-    else:
-        pattern = zero_or_more(any_char())
+        stop_regex += [quote_regex(s) for s in stop]
+        if len(stop_regex) == 1:
+            gen_stop = stop_regex[0]
+        else:
+            gen_stop = "|".join("(" + s + ")" for s in stop_regex)
+
+    if regex is None:
+        regex = r"(?s:.*)"
+    if save_stop_text is True:
+        save_stop_text = str(name) + "_stop_text"
+    if not isinstance(save_stop_text, str):
+        save_stop_text = None
 
     tagged_name = "__LIST_APPEND:" + name if list_append and name is not None else name
+
+    if tools is not None:
+        tools = [Tool(callable=x) if not isinstance(x, Tool) else x for x in tools]
+        options = [
+            Gen(body_regex=regex, stop_regex=gen_stop, save_stop_text=save_stop_text, max_tokens=max_tokens)
+        ]
+        for i, tool in enumerate(tools):
+            # Infer a regex that will match the start of a tool call
+            tool_call_prefix = tool.call_grammar.forced_prefix()
+            if len(tool_call_prefix) < 4:
+                # TODO: alternatively check that the prefix contains the name (case insensitive) of the tool?
+                # anything shorter is probably far too ambiguous
+                raise ValueError(f"Could not infer unambiguous tool call prefix for tool {tool.name}")
+            options.append(
+                capture(
+                    Gen(body_regex=regex, stop_regex=quote_regex(tool_call_prefix), max_tokens=max_tokens),
+                    name=f"tool{i}"
+                )
+            )
+        grm = with_temperature(select(options), temperature)
+        initial_token_count = lm.token_count
+        with block(tagged_name):
+            while lm.token_count <= max_tokens + initial_token_count:
+                lm += grm
+                tool_called = False
+                for i in range(len(tools)):
+                    tool_i = f"tool{i}"
+                    if tool_i in lm:
+                        tool_called = True
+                        if hide_tool_call:
+                            temp_lm = lm + tools[i].call_grammar
+                            with block("tool_call"):
+                                temp_lm += tools[i].tool_call()
+                            lm += temp_lm["tool_call"]
+                        else:
+                            lm += tools[i].call_grammar + tools[i].tool_call()
+                    lm = lm.remove(tool_i)
+                if not tool_called:
+                    lm += suffix
+                    break
+        return lm
+
+    pattern = Gen(body_regex=regex, stop_regex=gen_stop, save_stop_text=save_stop_text, capture_name=tagged_name, max_tokens=max_tokens)
 
     # define any capture group for non-tool calls
     if name is not None and tools is None:
         pattern = capture(pattern, name=tagged_name)
-    
-    # limit the number of tokens
-    pattern = token_limit(pattern, max_tokens)
-    
-    # define the stop pattern
-    if stop is False or len(stop + stop_regex) == 0:
-        stop_pattern = ''
-    else:
-        stop_pattern = select(stop + stop_regex)
-        if save_stop_text is True:
-            save_stop_text = str(name) + "_stop_text"
-        if isinstance(save_stop_text, str):
-            stop_pattern = capture(stop_pattern, name=save_stop_text)
-        stop_pattern = commit_point(stop_pattern, hidden=True)
+    lm += with_temperature(pattern + suffix, temperature)
 
-    # single generation
-    start_pos = len(str(lm))
-    if tools is not None:
-        with block(tagged_name):
-            tools = [Tool(callable=x) if not isinstance(x, Tool) else x for x in tools]
-            init_token_count = lm.token_count
-            gen_grammar = pattern + select([stop_pattern] + [capture(commit_point(x.call_grammar, hidden=hide_tool_call), name=f'tool{i}') for i, x in enumerate(tools)])
-            while lm.token_count <= max_tokens + init_token_count:
-                lm = lm._run_stateless(gen_grammar, temperature=temperature) # TODO: we should not be using this internal method
-                tool_called = False
-                for i in range(len(tools)):
-                    tool_i = f'tool{i}'
-                    if tool_i in lm:
-                        tool_called = True
-                        lm += tools[i].tool_call()
-                        lm = lm.remove(tool_i)
-                if not tool_called:
-                    lm += suffix
-                    break
-    elif n == 1:
-        lm += with_temperature(pattern + stop_pattern + suffix, temperature)
-
-    logger.debug(f'finish gen')
+    logger.debug(f"finish gen")
     return lm
 
 
 def click_loop_start(id, total_count, echo, color):
-    click_script = '''
+    click_script = (
+        """
 function cycle_IDVAL(button_el) {
 var i = 0;
 while (i < 50) {
@@ -191,23 +207,32 @@ i += 1;
 }
 button_el.innerHTML = (((i+1) % TOTALCOUNT) + 1)  + "/" + TOTALCOUNT;
 }
-cycle_IDVAL(this);'''.replace("IDVAL", id).replace("TOTALCOUNT", str(total_count)).replace("\n", "")
-    out = f'''<div style='background: rgba(255, 255, 255, 0.0); border-radius: 4px 0px 0px 4px; border: 1px solid {color}; border-right: 0px; padding-left: 3px; padding-right: 3px; user-select: none; color: {color}; display: inline; font-weight: normal; cursor: pointer' onClick='{click_script}'>1/{total_count}</div>'''
+cycle_IDVAL(this);""".replace(
+            "IDVAL", id
+        )
+        .replace("TOTALCOUNT", str(total_count))
+        .replace("\n", "")
+    )
+    out = f"""<div style='background: rgba(255, 255, 255, 0.0); border-radius: 4px 0px 0px 4px; border: 1px solid {color}; border-right: 0px; padding-left: 3px; padding-right: 3px; user-select: none; color: {color}; display: inline; font-weight: normal; cursor: pointer' onClick='{click_script}'>1/{total_count}</div>"""
     out += f"<div style='display: inline;' id='{id}_0'>"
     return "<||_html:" + out + "_||>"
+
 
 def click_loop_mid(id, index, echo):
     alpha = 1.0 if not echo else 0.5
     out = f"</div><div style='display: none; opacity: {alpha}' id='{id}_{index}'>"
     return "<||_html:" + out + "_||>"
 
+
 @guidance
 def gen_line(lm, *args, **kwargs):
-    return lm.gen(*args, suffix='\n', **kwargs)
+    return lm.gen(*args, suffix="\n", **kwargs)
+
 
 @guidance
 def gen_quote(lm, name=None, quote='"', *args, **kwargs):
-    return lm(quote).gen(*args,name=name, suffix=quote, **kwargs)
+    return lm(quote).gen(*args, name=name, suffix=quote, **kwargs)
+
 
 @guidance
 def will_gen(lm, stop=None, stop_regex=None, ignore_spaces=False, max_tokens=30):
@@ -222,18 +247,28 @@ def will_gen(lm, stop=None, stop_regex=None, ignore_spaces=False, max_tokens=30)
     if not stop_regex:
         stop_regex = []
     regexes = [regex_module.escape(x) for x in stop + stop_regex]
-    optional_space = '\\s*' if ignore_spaces else ''
+    optional_space = "\\s*" if ignore_spaces else ""
     pattern = regex_module.compile(f'{optional_space}({"|".join(regexes)})')
     lm2 = lm
     with silent():
         for _ in range(max_tokens):
-            lm2 += gen('temp_variable', list_append=True, max_tokens=1)
-            if not lm2['temp_variable'] or not pattern.match(''.join(lm2['temp_variable']), partial=True):
+            lm2 += gen("temp_variable", list_append=True, max_tokens=1)
+            if not lm2["temp_variable"] or not pattern.match(
+                "".join(lm2["temp_variable"]), partial=True
+            ):
                 return False
-            if pattern.match(''.join(lm2['temp_variable']), partial=False):
+            if pattern.match("".join(lm2["temp_variable"]), partial=False):
                 return True
     return False
 
+
 @guidance
 def call_tool(lm, tool):
-    return lm + tool.call_grammar + tool.tool_call()
+    lm += tool.call_grammar
+    lm += tool.tool_call()
+    return lm
+
+
+@guidance(stateless=True)
+def regex(lm, pattern, *, name=None):
+    return lm + gen(regex=pattern, name=name)

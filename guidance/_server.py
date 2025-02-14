@@ -1,26 +1,35 @@
-from fastapi import FastAPI, Request, HTTPException, Security
-from fastapi.security import APIKeyHeader
-from fastapi.responses import StreamingResponse
-import os  # For environment variables or config files
 import base64
+import os
+
+from typing import TYPE_CHECKING, Iterator
+
+try:
+    import pydantic
+
+    from fastapi import FastAPI, HTTPException, Security
+    from fastapi.security import APIKeyHeader
+    from fastapi.responses import StreamingResponse
+except ImportError:
+    if TYPE_CHECKING:
+        raise
 
 from .models._model import Model, Engine
-from ._grammar import GrammarFunction
-
-from pydantic import BaseModel, Field
+from ._schema import EngineCallResponse
 
 
-class GuidanceRequest(BaseModel):
-    parser: str = Field(
-        title="parser", description="The text generated so far by the guidance program"
+class GuidanceRequest(pydantic.BaseModel):
+    parser: str = pydantic.Field(
+        title="parser",
+        description="The text generated so far by the guidance program",
     )
-    grammar: str = Field(
+    grammar: str = pydantic.Field(
         title="grammar",
         description="Guidance grammar to constrain the next characters generated",
     )
 
 
 class Server:
+
     def __init__(self, engine, api_key=None, ssl_certfile=None, ssl_keyfile=None):
         """This exposes an Engine object over the network."""
 
@@ -50,19 +59,22 @@ class Server:
 
         @self.app.post("/extend")
         async def extend_parser(
-            guidance_request: GuidanceRequest, x_api_key: str = Security(api_key_header)
+            guidance_request: "GuidanceRequest",
+            x_api_key: str = Security(api_key_header),
         ):
             if x_api_key not in self.valid_api_keys:
                 raise HTTPException(status_code=401, detail="Invalid API key")
 
-            # data = await request.json()
-            # parser = data.get("parser")
-            grammar = GrammarFunction.deserialize(
-                base64.b64decode(guidance_request.grammar)
+            engine_responses: Iterator[EngineCallResponse] = self.engine(
+                guidance_request.parser, guidance_request.grammar
+            )
+            # Note the use of a generator comprehension here -- this will be evaluated lazily
+            json_stream: Iterator[str] = (
+                response.model_dump_json() for response in engine_responses
             )
 
             return StreamingResponse(
-                self.engine(guidance_request.parser, grammar),
+                json_stream,
                 media_type="application/json",
             )
 
