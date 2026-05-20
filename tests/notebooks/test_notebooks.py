@@ -47,6 +47,10 @@ class TestTutorials:
             params={"call_delay_secs": call_delay_secs, "requested_log_level": logging.DEBUG},
         )
 
+    def test_code_generation(self):
+        nb_path = TestTutorials.BASE_TUTORIAL_PATH / "code_generation.ipynb"
+        run_notebook(nb_path)
+
     def test_regex_constraints(self):
         nb_path = TestTutorials.BASE_TUTORIAL_PATH / "regex_constraints.ipynb"
         run_notebook(nb_path)
